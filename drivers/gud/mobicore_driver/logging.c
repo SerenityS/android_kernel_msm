@@ -51,17 +51,26 @@ struct logmsg_struct {
 	uint32_t log_data;		/* Value, if any */
 };
 
+static bool prev_eol;			/* Previous char was a EOL */
+static uint16_t prev_source;		/* Previous Log source */
 static uint32_t log_pos;		/* MobiCore log previous position */
 static struct mc_trace_buf *log_buf;	/* MobiCore log buffer structure */
 struct task_struct *log_thread;		/* Log Thread task structure */
 static char *log_line;			/* Log Line buffer */
 static uint32_t log_line_len;		/* Log Line buffer current length */
 
-static void log_eol(void)
+static void log_eol(uint16_t source)
 {
 	if (!strnlen(log_line, LOG_LINE_SIZE))
 		return;
-	dev_info(mcd, "%s\n", log_line);
+	prev_eol = true;
+	/* MobiCore Userspace */
+	if (prev_source)
+		dev_dbg(mcd, "%03x|%s\n", prev_source, log_line);
+	/* MobiCore kernel */
+	else
+		dev_dbg(mcd, "%s\n", log_line);
+
 	log_line_len = 0;
 	log_line[0] = 0;
 }
@@ -70,53 +79,29 @@ static void log_eol(void)
  * Collect chars in log_line buffer and output the buffer when it is full.
  * No locking needed because only "mobicore_log" thread updates this buffer.
  */
-static void log_char(char ch)
+static void log_char(char ch, uint16_t source)
 {
 	if (ch == '\n' || ch == '\r') {
-		log_eol();
+		log_eol(source);
 		return;
 	}
 
-	if (log_line_len >= LOG_LINE_SIZE - 1) {
-		dev_info(mcd, "%s\n", log_line);
-		log_line_len = 0;
-		log_line[0] = 0;
-	}
+	if (log_line_len >= LOG_LINE_SIZE - 1 || source != prev_source)
+		log_eol(source);
+
 
 	log_line[log_line_len] = ch;
 	log_line[log_line_len + 1] = 0;
 	log_line_len++;
-}
-
-/*
- * Put a string to the log line.
- */
-static void log_str(const char *s)
-{
-	int i;
-
-	for (i = 0; i < strnlen(s, LOG_LINE_SIZE); i++)
-		log_char(s[i]);
-}
-
-static uint32_t process_v1log(void)
-{
-	char *last_char = log_buf->buff + log_buf->write_pos;
-	char *buff = log_buf->buff + log_pos;
-	while (buff != last_char) {
-		log_char(*(buff++));
-		/* Wrap around */
-		if (buff - (char *)log_buf >= log_size)
-			buff = log_buf->buff;
-	}
-	return buff - log_buf->buff;
+	prev_eol = false;
+	prev_source = source;
 }
 
 static const uint8_t HEX2ASCII[16] = {
 	'0', '1', '2', '3', '4', '5', '6', '7',
 	'8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
 
-static void dbg_raw_nro(uint32_t format, uint32_t value)
+static void dbg_raw_nro(uint32_t format, uint32_t value, uint16_t source)
 {
 	int digits = 1;
 	uint32_t base = (format & LOG_INTEGER_DECIMAL) ? 10 : 16;
@@ -139,17 +124,17 @@ static void dbg_raw_nro(uint32_t format, uint32_t value)
 	if (width > digits) {
 		char ch = (base == 10) ? ' ' : '0';
 		while (width > digits) {
-			log_char(ch);
+			log_char(ch, source);
 			width--;
 		}
 	}
 
 	if (negative)
-		log_char('-');
+		log_char('-', source);
 
 	while (digits-- > 0) {
 		uint32_t d = value / digit_base;
-		log_char(HEX2ASCII[d]);
+		log_char(HEX2ASCII[d], source);
 		value = value - d * digit_base;
 		digit_base /= base;
 	}
@@ -157,36 +142,32 @@ static void dbg_raw_nro(uint32_t format, uint32_t value)
 
 static void log_msg(struct logmsg_struct *msg)
 {
-	unsigned char msgtxt[5];
-	int mpos = 0;
-
 	switch (msg->ctrl & LOG_TYPE_MASK) {
 	case LOG_TYPE_CHAR: {
 		uint32_t ch;
 		ch = msg->log_data;
 		while (ch != 0) {
-			msgtxt[mpos++] = ch&0xFF;
+			log_char(ch & 0xFF, msg->source);
 			ch >>= 8;
 		}
-		msgtxt[mpos] = 0;
-		log_str(msgtxt);
 		break;
 	}
 	case LOG_TYPE_INTEGER: {
-		dbg_raw_nro(msg->ctrl, msg->log_data);
+		dbg_raw_nro(msg->ctrl, msg->log_data, msg->source);
 		break;
 	}
 	default:
 		break;
 	}
 	if (msg->ctrl & LOG_EOL)
-		log_eol();
+		log_eol(msg->source);
 }
 
-static uint32_t process_v2log(void)
+static uint32_t process_log(void)
 {
 	char *last_msg = log_buf->buff + log_buf->write_pos;
 	char *buff = log_buf->buff + log_pos;
+
 	while (buff != last_msg) {
 		log_msg((struct logmsg_struct *)buff);
 		buff += sizeof(struct logmsg_struct);
@@ -209,11 +190,8 @@ static int log_worker(void *p)
 			schedule_timeout_interruptible(MAX_SCHEDULE_TIMEOUT);
 
 		switch (log_buf->version) {
-		case 1:
-			log_pos = process_v1log();
-			break;
 		case 2:
-			log_pos = process_v2log();
+			log_pos = process_log();
 			break;
 		default:
 			MCDRV_DBG_ERROR(mcd, "Unknown Mobicore log data");
@@ -258,6 +236,8 @@ long mobicore_log_setup(void)
 	log_thread = NULL;
 	log_line = NULL;
 	log_line_len = 0;
+	prev_eol = false;
+	prev_source = 0;
 
 	/* Sanity check for the log size */
 	if (log_size < PAGE_SIZE)
@@ -310,6 +290,7 @@ long mobicore_log_setup(void)
 		ret = -EIO;
 		goto mobicore_log_setup_kthread;
 	}
+	set_task_state(log_thread, TASK_INTERRUPTIBLE);
 
 	MCDRV_DBG(mcd, "fc_log Logger version %u\n", log_buf->version);
 	return 0;

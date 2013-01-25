@@ -81,29 +81,67 @@ static inline void free_continguous_pages(void *addr, unsigned int order)
 }
 
 /* Frees the memory associated with a buffer */
-static int free_buffer(struct mc_buffer *buffer)
+static int free_buffer(struct mc_buffer *buffer, bool unlock)
 {
-	if (buffer->handle == 0)
+	struct mm_struct *mm = current->mm;
+	if (buffer->handle == 0 || buffer->uaddr == 0)
 		return -EINVAL;
 
 	if (buffer->addr == 0)
 		return -EINVAL;
 
-	if (!atomic_dec_and_test(&buffer->usage)) {
+	MCDRV_DBG(mcd, "handle=%u phys_addr=0x%p, virt_addr=0x%p len=%u\n",
+		  buffer->handle, buffer->phys, buffer->addr, buffer->len);
 
-		MCDRV_DBG_VERBOSE(mcd, "Could not free buffer h=%u",
-				  buffer->handle);
+	if (unlock == false)
+		if (do_munmap(mm, (long unsigned int)buffer->uaddr, buffer->len)
+		    < 0) {
+			MCDRV_DBG_ERROR(mcd, "Memory can't be unmapped\n");
+			return -EINVAL;
+		}
+
+
+	if (!atomic_dec_and_test(&buffer->usage)) {
+		MCDRV_DBG_VERBOSE(mcd, "Could not free %u", buffer->handle);
 		return 0;
 	}
-
-	MCDRV_DBG(mcd, "handle=%u phys_addr=0x%p, virt_addr=0x%p\n",
-		  buffer->handle, buffer->phys, buffer->addr);
 
 	list_del(&buffer->list);
 
 	free_continguous_pages(buffer->addr, buffer->order);
 	kfree(buffer);
 	return 0;
+}
+
+static uint32_t mc_find_cont_wsm_addr(struct mc_instance *instance, void *uaddr,
+	uint32_t *addr, uint32_t len)
+{
+	int ret = 0;
+	struct mc_buffer *buffer;
+
+	if (WARN(!instance, "No instance data available"))
+		return -EFAULT;
+
+	mutex_lock(&instance->lock);
+
+	mutex_lock(&ctx.bufs_lock);
+
+	/* search for the given handle in the buffers list */
+	list_for_each_entry(buffer, &ctx.cont_bufs, list) {
+		if (buffer->uaddr == uaddr && buffer->len == len) {
+			*addr = (uint32_t)buffer->addr;
+			goto found;
+		}
+	}
+
+	/* Coundn't find the buffer */
+	ret = -EINVAL;
+
+found:
+	mutex_unlock(&ctx.bufs_lock);
+	mutex_unlock(&instance->lock);
+
+	return ret;
 }
 
 static uint32_t mc_find_cont_wsm(struct mc_instance *instance, uint32_t handle,
@@ -152,7 +190,8 @@ found:
  * Returns 0 if no error
  *
  */
-static int __free_buffer(struct mc_instance *instance, uint32_t handle)
+static int __free_buffer(struct mc_instance *instance, uint32_t handle,
+		bool unlock)
 {
 	int ret = 0;
 	struct mc_buffer *buffer;
@@ -170,7 +209,7 @@ static int __free_buffer(struct mc_instance *instance, uint32_t handle)
 	goto err;
 
 del_buffer:
-	ret = free_buffer(buffer);
+	ret = free_buffer(buffer, unlock);
 err:
 	mutex_unlock(&ctx.bufs_lock);
 	return ret;
@@ -185,7 +224,7 @@ int mc_free_buffer(struct mc_instance *instance, uint32_t handle)
 
 	mutex_lock(&instance->lock);
 
-	ret = __free_buffer(instance, handle);
+	ret = __free_buffer(instance, handle, false);
 	mutex_unlock(&instance->lock);
 	return ret;
 }
@@ -332,6 +371,7 @@ int mc_register_wsm_l2(struct mc_instance *instance,
 	int ret = 0;
 	struct mc_l2_table *table = NULL;
 	struct task_struct *task = current;
+	uint32_t kbuff = 0x0;
 
 	if (WARN(!instance, "No instance data available"))
 		return -EFAULT;
@@ -341,7 +381,12 @@ int mc_register_wsm_l2(struct mc_instance *instance,
 		return -EINVAL;
 	}
 
-	table = mc_alloc_l2_table(instance, task, (void *)buffer, len);
+	MCDRV_DBG_VERBOSE(mcd, "buffer: %p, len=%08x\n", (void *)buffer, len);
+
+	if (!mc_find_cont_wsm_addr(instance, (void *)buffer, &kbuff, len))
+		table = mc_alloc_l2_table(instance, NULL, (void *)kbuff, len);
+	else
+		table = mc_alloc_l2_table(instance, task, (void *)buffer, len);
 
 	if (IS_ERR(table)) {
 		MCDRV_DBG_ERROR(mcd, "new_used_l2_table() failed\n");
@@ -421,7 +466,7 @@ static int mc_unlock_handle(struct mc_instance *instance, uint32_t handle)
 	/* Not a l2 table, then it must be a buffer */
 	if (ret == -EINVAL) {
 		/* Call the non locking variant! */
-		ret = __free_buffer(instance, handle);
+		ret = __free_buffer(instance, handle, true);
 	}
 	mutex_unlock(&instance->lock);
 
@@ -496,6 +541,7 @@ static int mc_fd_mmap(struct file *file, struct vm_area_struct *vmarea)
 		return -EINVAL;
 
 found:
+		buffer->uaddr = (void *)vmarea->vm_start;
 		vmarea->vm_flags |= VM_RESERVED;
 		/*
 		 * Convert kernel address to user address. Kernel address begins
@@ -887,7 +933,7 @@ int mc_release_instance(struct mc_instance *instance)
 	list_for_each_entry_safe(buffer, tmp, &ctx.cont_bufs, list) {
 		if (buffer->instance == instance) {
 			buffer->instance = NULL;
-			free_buffer(buffer);
+			free_buffer(buffer, false);
 		}
 	}
 	mutex_unlock(&ctx.bufs_lock);
